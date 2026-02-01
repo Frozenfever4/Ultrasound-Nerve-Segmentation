@@ -1,3 +1,5 @@
+#necessary imports and configuration
+
 import os, time, random
 from glob import glob
 import numpy as np
@@ -10,276 +12,373 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 
-# ------------------------
-# Config
-# ------------------------
+%matplotlib inline
+
 class CFG:
     IMG_SIZE = 256
-    BATCH = 8 
+    BATCH = 8
     LR = 1e-4
-    EPOCHS = 10
+    EPOCHS = 50
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    SAVE_DIR = "/kaggle/working/models"
 
-os.makedirs(CFG.SAVE_DIR, exist_ok=True)
 
-# ------------------------
-# Dataset
-# ------------------------
-class UltrasoundDataset(Dataset):
-    def __init__(self, img_paths, mask_paths):
-        self.imgs = img_paths
-        self.masks = mask_paths
+# Dataset and Visualization
 
-    def __len__(self): 
-        return len(self.imgs)
+class KaggleNerveDataset(Dataset):
+    def __init__(self, image_folder):
+        self.image_paths = sorted([os.path.join(image_folder,f) 
+                                   for f in os.listdir(image_folder) if "_mask" not in f])
+        self.mask_paths = [f.replace(".tif","_mask.tif") for f in self.image_paths]
+
+    def __len__(self):
+        return len(self.image_paths)
 
     def __getitem__(self, idx):
-        img = cv2.imread(self.imgs[idx], 0)
-        img = cv2.resize(img, (CFG.IMG_SIZE, CFG.IMG_SIZE))
-        img = img.astype(np.float32) / 255.0
+        img = cv2.imread(self.image_paths[idx],0)
+        mask = cv2.imread(self.mask_paths[idx],0)
 
-        mask = cv2.imread(self.masks[idx], 0)
-        mask = cv2.resize(mask, (CFG.IMG_SIZE, CFG.IMG_SIZE))
-        mask = (mask > 127).astype(np.float32)
+        img = cv2.resize(img,(CFG.IMG_SIZE,CFG.IMG_SIZE))/255.0
+        mask = cv2.resize(mask,(CFG.IMG_SIZE,CFG.IMG_SIZE))
+        mask = (mask>127).astype(np.float32)
 
-        img = torch.tensor(img).unsqueeze(0)
-        mask = torch.tensor(mask).unsqueeze(0)
-        return img, mask
+        return (
+            torch.tensor(img).unsqueeze(0).float(),
+            torch.tensor(mask).unsqueeze(0).float()
+        )
 
-# ------------------------
-# Kaggle-safe Loader
-# ------------------------
-def build_loaders():
-    base = "/kaggle/input/ultrasound-nerve-segmentation"
-    if os.path.exists(base + "/ultrasound-nerve-segmentation"):
-        base = base + "/ultrasound-nerve-segmentation"
 
-    train_path = base + "/train/"
-    test_path  = base + "/test/"
+def visualize_input(img, mask):
+    plt.figure(figsize=(10,4))
+    plt.subplot(1,2,1); plt.imshow(img.squeeze(), cmap='gray'); plt.title("Raw Image")
+    plt.subplot(1,2,2); plt.imshow(mask.squeeze(), cmap='viridis'); plt.title("GT Mask")
+    plt.axis('off'); plt.show()
 
-    all_train = sorted(glob(train_path + "*.tif"))
-    train_imgs  = [f for f in all_train if "_mask" not in f]
-    train_masks = [f for f in all_train if "_mask" in f]
 
-    all_test = sorted(glob(test_path + "*.tif"))
-    test_imgs  = [f for f in all_test if "_mask" not in f]
+train_path = "/kaggle/input/ultrasound-nerve-segmentation/train/"
+nerve_data = KaggleNerveDataset(train_path)
 
-    print("Train Images:", len(train_imgs))
-    print("Train Masks :", len(train_masks))
-    print("Test Images :", len(test_imgs))
+sample_img, sample_mask = nerve_data[0]
+visualize_input(sample_img, sample_mask)
 
-    if len(train_imgs) == 0:
-        raise ValueError("Dataset path incorrect!")
 
-    tr_imgs, val_imgs, tr_masks, val_masks = train_test_split(
-        train_imgs, train_masks, test_size=0.2, random_state=42
-    )
+# Diffusion Denoiser
 
-    train_ds = UltrasoundDataset(tr_imgs, tr_masks)
-    val_ds   = UltrasoundDataset(val_imgs, val_masks)
-
-    train_loader = DataLoader(train_ds, batch_size=CFG.BATCH, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=CFG.BATCH, shuffle=False)
-
-    return train_loader, val_loader, test_imgs
-
-# ------------------------
-# Edge-Aware Fusion
-# ------------------------
-class EdgeAwareFusion(nn.Module):
+class DiffusionDenoiser(nn.Module):
     def __init__(self):
         super().__init__()
-        self.sobel_x = nn.Conv2d(1,1,3,padding=1,bias=False)
-        self.sobel_y = nn.Conv2d(1,1,3,padding=1,bias=False)
-        self.fuse    = nn.Conv2d(3,1,1)
-
-        sx = torch.tensor([[[-1,0,1],[-2,0,2],[-1,0,1]]],dtype=torch.float32).unsqueeze(0)
-        sy = torch.tensor([[[-1,-2,-1],[0,0,0],[1,2,1]]],dtype=torch.float32).unsqueeze(0)
-        self.sobel_x.weight.data = sx
-        self.sobel_y.weight.data = sy
-
-        for p in self.sobel_x.parameters(): p.requires_grad=False
-        for p in self.sobel_y.parameters(): p.requires_grad=False
+        self.net = nn.Sequential(
+            nn.Conv2d(1,32,3,padding=1), nn.ReLU(),
+            nn.Conv2d(32,32,3,padding=1), nn.ReLU(),
+            nn.Conv2d(32,1,3,padding=1)
+        )
 
     def forward(self,x):
-        ex = self.sobel_x(x)
-        ey = self.sobel_y(x)
-        edge = torch.sqrt(ex**2 + ey**2 + 1e-6)
-        fused = torch.cat([x, edge, x-edge], dim=1)
-        return fused   # 3-channel fused feature map
+        noise = self.net(x)
+        return torch.clamp(x-noise,0,1)
 
-# ------------------------
-# Model Blocks
-# ------------------------
+
+def visualize_denoising(raw, denoised):
+    plt.figure(figsize=(10,4))
+    plt.subplot(1,2,1); plt.imshow(raw.squeeze(), cmap='gray'); plt.title("Raw")
+    plt.subplot(1,2,2); plt.imshow(denoised.squeeze(), cmap='gray'); plt.title("Denoised")
+    plt.axis('off'); plt.show()
+
+
+denoiser = DiffusionDenoiser().eval()
+with torch.no_grad():
+    den = denoiser(sample_img.unsqueeze(0))
+visualize_denoising(sample_img, den[0])
+
+
+# Edge Extraction
+
+class EdgeExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        kx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]]).float().view(1,1,3,3)
+        ky = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]]).float().view(1,1,3,3)
+        self.register_buffer('kx',kx)
+        self.register_buffer('ky',ky)
+
+    def forward(self,x):
+        gx = F.conv2d(x,self.kx,padding=1)
+        gy = F.conv2d(x,self.ky,padding=1)
+        return torch.sqrt(gx**2+gy**2+1e-6)
+
+
+edge_ext = EdgeExtractor().eval()
+with torch.no_grad():
+    edges = edge_ext(den)
+
+
+plt.imshow(edges[0].squeeze(), cmap='magma')
+plt.title("Edge Map")
+plt.colorbar(); plt.show()
+
+
+# Edge-Fusion UNet
+
 class ConvBlock(nn.Module):
     def __init__(self,in_c,out_c):
         super().__init__()
-        self.conv = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Conv2d(in_c,out_c,3,padding=1),
             nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True),
+            nn.ReLU(),
             nn.Conv2d(out_c,out_c,3,padding=1),
             nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True)
+            nn.ReLU()
         )
-    def forward(self,x): return self.conv(x)
+    def forward(self,x): return self.net(x)
 
-class UNetSmall(nn.Module):
+class EdgeFusionUNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.d1 = ConvBlock(3,32)
-        self.d2 = ConvBlock(32,64)
-        self.b  = ConvBlock(64,128)
-        self.u2 = ConvBlock(128+64,64)
-        self.u1 = ConvBlock(64+32,32)
+        self.denoiser = DiffusionDenoiser()
+        self.edge = EdgeExtractor()
+
+        self.enc1 = ConvBlock(3,32)
+        self.enc2 = ConvBlock(32,64)
+        self.bott = ConvBlock(64,128)
+
+        self.dec2 = ConvBlock(128+64,64)
+        self.dec1 = ConvBlock(64+32,32)
+
         self.out = nn.Conv2d(32,1,1)
 
     def forward(self,x):
-        c1 = self.d1(x); p1 = F.max_pool2d(c1,2)
-        c2 = self.d2(p1); p2 = F.max_pool2d(c2,2)
-        b  = self.b(p2)
-        u2 = F.interpolate(b,scale_factor=2,mode="bilinear",align_corners=False)
-        u2 = self.u2(torch.cat([u2,c2],1))
-        u1 = F.interpolate(u2,scale_factor=2,mode="bilinear",align_corners=False)
-        u1 = self.u1(torch.cat([u1,c1],1))
-        return self.out(u1)
+        xd = self.denoiser(x)
+        xe = self.edge(xd)
+        fused = torch.cat([x,xd,xe],1)
 
-class SegNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.enc = nn.Sequential(
-            nn.Conv2d(3,64,3,padding=1),nn.ReLU(),nn.MaxPool2d(2),
-            nn.Conv2d(64,128,3,padding=1),nn.ReLU(),nn.MaxPool2d(2))
-        self.dec = nn.Sequential(
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(128,64,3,padding=1),nn.ReLU(),
-            nn.Upsample(scale_factor=2),
-            nn.Conv2d(64,1,3,padding=1))
-    def forward(self,x): return self.dec(self.enc(x))
+        c1 = self.enc1(fused); p1 = F.max_pool2d(c1,2)
+        c2 = self.enc2(p1); p2 = F.max_pool2d(c2,2)
+        b  = self.bott(p2)
 
-class AttentionUNet(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.c1 = ConvBlock(3,32)
-        self.c2 = ConvBlock(32,64)
-        self.b  = ConvBlock(64,128)
-        self.att = nn.Sequential(nn.Conv2d(128,64,1),nn.Sigmoid())
-        self.u2 = ConvBlock(128+64,64)
-        self.u1 = ConvBlock(64+32,32)
-        self.out = nn.Conv2d(32,1,1)
+        u2 = F.interpolate(b,scale_factor=2)
+        u2 = self.dec2(torch.cat([u2,c2],1))
+        u1 = F.interpolate(u2,scale_factor=2)
+        u1 = self.dec1(torch.cat([u1,c1],1))
 
-    def forward(self,x):
-        c1 = self.c1(x); p1 = F.max_pool2d(c1,2)
-        c2 = self.c2(p1); p2 = F.max_pool2d(c2,2)
-        b  = self.b(p2)
-        up2 = F.interpolate(b,scale_factor=2,mode="bilinear",align_corners=False)
-        att = self.att(up2)
-        u2 = self.u2(torch.cat([up2,c2*att],1))
-        u1 = F.interpolate(u2,scale_factor=2,mode="bilinear",align_corners=False)
-        u1 = self.u1(torch.cat([u1,c1],1))
-        return self.out(u1)
+        return torch.sigmoid(self.out(u1)), xd, xe
 
-# ------------------------
+
+model = EdgeFusionUNet().eval()
+with torch.no_grad():
+    pred, xd, xe = model(sample_img.unsqueeze(0))
+
+
+def visualize_full(raw, den, edge, pred, gt):
+    titles = ["Raw","Denoised","Edges","Prediction","GT"]
+    imgs = [raw, den, edge, pred, gt]
+
+    plt.figure(figsize=(22,4))
+    for i in range(5):
+        plt.subplot(1,5,i+1)
+        plt.imshow(imgs[i].squeeze(), cmap='gray')
+        plt.title(titles[i]); plt.axis('off')
+    plt.show()
+
+
+visualize_full(sample_img, xd[0], xe[0], pred[0], sample_mask)
+
+
+# Loaders
+
+def build_loaders():
+    imgs = sorted([f for f in glob(train_path+"*.tif") if "_mask" not in f])
+    masks = sorted([f for f in glob(train_path+"*.tif") if "_mask" in f])
+
+    tr_i, val_i, tr_m, val_m = train_test_split(
+        imgs, masks, test_size=0.2, random_state=42)
+
+    train_ds = KaggleNerveDataset(train_path)
+    val_ds   = KaggleNerveDataset(train_path)
+
+    return (
+        DataLoader(train_ds,CFG.BATCH,shuffle=True),
+        DataLoader(val_ds,CFG.BATCH,shuffle=False)
+    )
+
+
 # Metrics
-# ------------------------
-def dice_score(pred,mask):
-    pred = torch.sigmoid(pred)
+
+def metrics(pred, gt):
     pred = (pred>0.5).float()
-    inter = (pred*mask).sum()
-    union = pred.sum()+mask.sum()
-    return (2*inter+1e-6)/(union+1e-6)
+    tp = (pred*gt).sum()
+    fp = (pred*(1-gt)).sum()
+    fn = ((1-pred)*gt).sum()
 
-# ------------------------
-# Training with History
-# ------------------------
-def train_model(model,fusion,train_loader,val_loader,model_name):
+    dice = (2*tp)/(2*tp+fp+fn+1e-6)
+    precision = tp/(tp+fp+1e-6)
+    recall = tp/(tp+fn+1e-6)
+    accuracy = (pred==gt).float().mean()
+
+    return dice.item(), precision.item(), recall.item(), accuracy.item()
+
+
+# Training Loop
+
+def train(model, loader):
     model.to(CFG.device)
-    fusion.to(CFG.device)
+    opt = torch.optim.Adam(model.parameters(),CFG.LR)
+    loss_fn = nn.BCELoss()
 
-    opt = torch.optim.Adam(list(model.parameters())+list(fusion.parameters()),lr=CFG.LR)
-    criterion = nn.BCEWithLogitsLoss()
+    hist = {"loss":[], "dice":[], "prec":[], "rec":[], "acc":[]}
 
-    train_loss_hist=[]
-    val_dice_hist=[]
-    time_hist=[]
+    for ep in range(CFG.EPOCHS):
+        model.train()
+        for x,y in loader:
+            x,y = x.to(CFG.device), y.to(CFG.device)
+            p,_,_ = model(x)
+            loss = loss_fn(p,y)
 
-    for epoch in range(CFG.EPOCHS):
-        start=time.time()
-        model.train(); fusion.train()
-        total_loss=0
+            opt.zero_grad(); loss.backward(); opt.step()
 
-        for imgs,masks in train_loader:
-            imgs,masks = imgs.to(CFG.device), masks.to(CFG.device)
-
-            fused = fusion(imgs)
-            preds = model(fused)
-            loss = criterion(preds,masks)
-
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            total_loss+=loss.item()
-
-        avg_loss = total_loss/len(train_loader)
-        train_loss_hist.append(avg_loss)
-
-        model.eval(); fusion.eval()
-        vd=0
+        model.eval()
+        d=p=r=a=0
         with torch.no_grad():
-            for imgs,masks in val_loader:
-                imgs,masks = imgs.to(CFG.device), masks.to(CFG.device)
-                preds = model(fusion(imgs))
-                vd+=dice_score(preds,masks).item()
+            for x,y in loader:
+                x,y = x.to(CFG.device), y.to(CFG.device)
+                p,_,_ = model(x)
+                md,mp,mr,ma = metrics(p,y)
+                d+=md; p+=mp; r+=mr; a+=ma
 
-        avg_dice = vd/len(val_loader)
-        val_dice_hist.append(avg_dice)
+        hist["loss"].append(loss.item())
+        hist["dice"].append(d/len(loader))
+        hist["prec"].append(p/len(loader))
+        hist["rec"].append(r/len(loader))
+        hist["acc"].append(a/len(loader))
 
-        epoch_time=time.time()-start
-        time_hist.append(epoch_time)
+        print(f"Epoch {ep+1} Dice {hist['dice'][-1]:.4f}")
 
-        print(f"{model_name} | Epoch {epoch+1}/{CFG.EPOCHS} | Loss {avg_loss:.4f} | Dice {avg_dice:.4f} | Time {epoch_time:.1f}s")
+    return hist
 
-    return train_loss_hist,val_dice_hist,time_hist
 
-# ------------------------
-# Plotting Curves
-# ------------------------
-def plot_curves(train_loss,val_dice,time_hist,model_name):
+train_loader,_ = build_loaders()
+edgefusion = EdgeFusionUNet()
+history = train(edgefusion, train_loader)
 
-    plt.figure()
-    plt.plot(train_loss,marker='o')
-    plt.title(f"{model_name} - Training Loss")
-    plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.grid()
-    plt.show()
 
-    plt.figure()
-    plt.plot(val_dice,marker='o')
-    plt.title(f"{model_name} - Validation Dice")
-    plt.xlabel("Epoch"); plt.ylabel("Dice"); plt.grid()
-    plt.show()
 
-    plt.figure()
-    plt.plot(time_hist,val_dice,marker='o')
-    plt.title(f"{model_name} - Time vs Dice")
-    plt.xlabel("Time per Epoch (s)")
-    plt.ylabel("Validation Dice")
-    plt.grid()
-    plt.show()
+# history should be like this
+#history = {
+#    "train_loss": [],
+#    "val_loss": [],
+#    "train_dice": [],
+#    "val_dice": [],
+#    "train_acc": [],
+#    "val_acc": [],
+#    "train_prec": [],
+#    "val_prec": [],
+#    "train_rec": [],
+#    "val_rec": [],
+#    "epoch_time": []   # seconds per epoch
+#}
 
-# ------------------------
-# Run Training
-# ------------------------
-train_loader,val_loader,test_imgs = build_loaders()
 
-models={
-    "UNetSmall":UNetSmall(),
-    "SegNet":SegNet(),
-    "AttentionUNet":AttentionUNet()
-}
+# Plots
 
-for name,model in models.items():
-    print("\nTraining:",name)
-    fusion = EdgeAwareFusion()
-    tr_loss,val_dice,t_hist = train_model(model,fusion,train_loader,val_loader,name)
-    plot_curves(tr_loss,val_dice,t_hist,name)
+plt.plot(history["dice"]); plt.title("Dice"); plt.grid(); plt.show()
+plt.plot(history["prec"],label="Precision")
+plt.plot(history["rec"],label="Recall")
+plt.legend(); plt.grid(); plt.show()
+plt.plot(history["acc"]); plt.title("Accuracy"); plt.grid(); plt.show()
+
+
+plt.figure(figsize=(6,4))
+plt.plot(history["train_loss"], label="Train Loss")
+plt.plot(history["val_loss"], label="Val Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Training vs Validation Loss")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+plt.figure(figsize=(6,4))
+plt.plot(history["train_dice"], label="Train Dice")
+plt.plot(history["val_dice"], label="Val Dice")
+plt.xlabel("Epoch")
+plt.ylabel("Dice Score")
+plt.title("Training vs Validation Dice")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+plt.figure(figsize=(6,4))
+plt.plot(history["train_prec"], label="Train Precision")
+plt.plot(history["val_prec"], label="Val Precision")
+plt.plot(history["train_rec"], label="Train Recall")
+plt.plot(history["val_rec"], label="Val Recall")
+plt.xlabel("Epoch")
+plt.ylabel("Score")
+plt.title("Precision & Recall Curves")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+plt.figure(figsize=(6,4))
+plt.plot(history["train_acc"], label="Train Accuracy")
+plt.plot(history["val_acc"], label="Val Accuracy")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.title("Training vs Validation Accuracy")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+all_probs = []
+all_gt = []
+
+from sklearn.metrics import roc_curve, auc
+
+fpr, tpr, _ = roc_curve(all_gt, all_probs)
+roc_auc = auc(fpr, tpr)
+
+plt.figure(figsize=(5,5))
+plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.4f}")
+plt.plot([0,1],[0,1],'--')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve (EdgeFusionNet)")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+plt.figure(figsize=(6,4))
+plt.plot(history["epoch_time"])
+plt.xlabel("Epoch")
+plt.ylabel("Time (seconds)")
+plt.title("Computational Time per Epoch")
+plt.grid()
+plt.show()
+
+print("Avg Epoch Time:", np.mean(history["epoch_time"]))
+
+
+plt.figure(figsize=(6,4))
+plt.plot(history["val_loss"], label="Val Loss")
+plt.plot(history["val_dice"], label="Val Dice")
+plt.xlabel("Epoch")
+plt.title("Loss vs Dice Progression")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+gap = np.array(history["train_dice"]) - np.array(history["val_dice"])
+
+plt.figure(figsize=(6,4))
+plt.plot(gap)
+plt.xlabel("Epoch")
+plt.ylabel("Dice Gap (Train − Val)")
+plt.title("Overfitting Analysis")
+plt.grid()
+plt.show()
+
